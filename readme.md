@@ -4,7 +4,7 @@
 
 ### 快速开始（目录方式）
 
-`
+```
 use Framework\Config\Config;
 use Framework\Config\Cache\ConfigCache;
 
@@ -19,6 +19,6 @@ $all = $config->load();
 // 使用点语法读取
 $dbHost = $config->get('database.host', '127.0.0.1');
 
-`
+```
 
 ### 欢迎star & fork 
