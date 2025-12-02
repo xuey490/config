@@ -1,0 +1,23 @@
+{
+  "name": "xuey490/config",
+  "description": "FssPHP Configuration loader library,supporting PHP/JSON/INI with caching (namespace Framework\\Config)",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Framework\\Config\\": "src/"
+    }
+  },
+  "require": {
+    "php": ">=8.1"
+  },
+  "require-dev": {
+    "friendsofphp/php-cs-fixer": "^3.6",
+    "phpunit/phpunit": "^11.0",
+    "phpstan/phpstan": "^2.0"
+  },
+  "scripts": {
+    "test": "phpunit --colors=always",
+    "analyse": "phpstan analyse src --level 7"
+  }
+}
