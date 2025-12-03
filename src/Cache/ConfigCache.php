@@ -8,28 +8,30 @@ declare(strict_types=1);
  * @link     https://github.com/xuey490/project
  * @license  https://github.com/xuey490/project/blob/main/LICENSE
  *
- * @Filename: ConfigCache.php
- * @Date: 2025-12-4
+ * @Filename: ConfigService.php
+ * @Date: 2025-12-3
  * @Developer: xuey863toy
  * @Email: xuey863toy@gmail.com
  */
- 
+
 namespace Framework\Config\Cache;
 
 use Framework\Config\Exception\ConfigException;
 
+/**
+ * 配置缓存：支持自动刷新机制（基于文件签名）
+ */
 class ConfigCache
 {
+    /** @var string 缓存文件 */
     private string $cacheFile;
-    private int $ttl;
-    private array $configFiles = []; // 配置文件列表（自动收集，无需手动传）
 
-    /**
-     * 完全兼容原有构造函数！无需额外传参
-     * @param string $cacheFile 缓存文件路径
-     * @param int $ttl 有效期（秒）
-     * @param array $configFiles 配置文件列表（可选，自动收集）
-     */
+    /** @var int 缓存有效期（秒） */
+    private int $ttl;
+
+    /** @var array 当前参与签名的配置文件 */
+    private array $configFiles = [];
+
     public function __construct(string $cacheFile, int $ttl = 3600, array $configFiles = [])
     {
         $this->validateCachePath($cacheFile);
@@ -39,22 +41,22 @@ class ConfigCache
     }
 
     /**
-     * 兼容原有 get() 方法：返回配置数组/NULL
+     * 获取缓存内容（支持自动刷新）
      */
     public function get(): ?array
     {
-        // 若未设置配置文件列表（首次调用），直接返回原有逻辑（不影响兼容）
+        // 未设置 configFiles → 使用旧逻辑（兼容）
         if (empty($this->configFiles)) {
             return $this->getOriginalCache();
         }
 
-        // 配置文件列表已设置，启用自动刷新逻辑
+        // 自动刷新机制：文件变动则清缓存
         if ($this->hasConfigFilesChanged()) {
             $this->clear();
             return null;
         }
 
-        if (!file_exists($this->cacheFile) || !is_readable($this->cacheFile)) {
+        if (!file_exists($this->cacheFile)) {
             return null;
         }
 
@@ -63,95 +65,49 @@ class ConfigCache
             return null;
         }
 
-        $cacheContent = file_get_contents($this->cacheFile);
-        if ($cacheContent === false) {
+        $data = @unserialize((string)file_get_contents($this->cacheFile));
+
+        if (!is_array($data) || !isset($data['config'], $data['file_signature'])) {
             $this->clear();
             return null;
         }
 
-        $cachedData = @unserialize($cacheContent);
-        if (!is_array($cachedData) || !isset($cachedData['config']) || !isset($cachedData['file_signature'])) {
-            $this->clear();
-            return null;
-        }
-
-        return $cachedData['config'];
+        return $data['config'];
     }
 
     /**
-     * 兼容原有 set() 方法：传入配置数组即可
+     * 保存缓存（自动刷新模式）
      */
     public function set(array $data): void
     {
-        // 若未设置配置文件列表，使用原有序列化逻辑（兼容旧缓存）
+        // 无 configFiles → 使用兼容旧逻辑
         if (empty($this->configFiles)) {
             $this->setOriginalCache($data);
             return;
         }
 
-        // 启用自动刷新逻辑：记录文件特征值
-        $fileSignature = $this->generateFileSignature();
-        $cacheData = [
-            'file_signature' => $fileSignature,
-            'config' => $data
+        $payload = [
+            'file_signature' => $this->generateFileSignature(),
+            'config'         => $data,
         ];
 
-        $serializedData = serialize($cacheData);
-        if ($serializedData === false) {
-            throw new ConfigException('Failed to serialize config data for caching');
-        }
-
-        $cacheDir = dirname($this->cacheFile);
-        if (!is_dir($cacheDir) && !mkdir($cacheDir, 0755, true)) {
-            throw new ConfigException("Failed to create cache directory: {$cacheDir}");
-        }
-
-        $fileHandle = fopen($this->cacheFile, 'w');
-        if (!$fileHandle) {
-            throw new ConfigException("Failed to open cache file for writing: {$this->cacheFile}");
-        }
-
-        if (!flock($fileHandle, LOCK_EX)) {
-            fclose($fileHandle);
-            throw new ConfigException("Failed to lock cache file: {$this->cacheFile}");
-        }
-
-        $writeResult = fwrite($fileHandle, $serializedData);
-        fflush($fileHandle);
-        flock($fileHandle, LOCK_UN);
-        fclose($fileHandle);
-
-        if ($writeResult === false || $writeResult !== strlen($serializedData)) {
-            $this->clear();
-            throw new ConfigException("Failed to write complete data to cache file: {$this->cacheFile}");
-        }
-
-        chmod($this->cacheFile, 0644);
+        $this->writeCacheData($payload);
     }
 
     /**
-     * 兼容原有 clear() 方法
+     * 删除缓存文件
      */
     public function clear(): bool
     {
-        if (file_exists($this->cacheFile)) {
-            return unlink($this->cacheFile);
-        }
-        return true;
+        return !file_exists($this->cacheFile) || unlink($this->cacheFile);
     }
 
     /**
-     * 新增：设置配置文件列表（由 Config 类自动调用，你无需关心）
+     * 设置配置文件列表（动态由 ConfigService 调用）
      */
-    public function setConfigFiles(array $configFiles): void
+    public function setConfigFiles(array $files): void
     {
-        $this->configFiles = $this->filterValidConfigFiles($configFiles);
-    }
-
-    // --- 原有 getter 方法（兼容用）---
-    public function getCacheFile(): string
-    {
-        return $this->cacheFile;
+        $this->configFiles = $this->filterValidConfigFiles($files);
     }
 
     public function getTtl(): int
@@ -159,42 +115,45 @@ class ConfigCache
         return $this->ttl;
     }
 
-    // --- 自动刷新核心逻辑（内部使用）---
+    // ---------------------------------------------------------------------
+    // 自动刷新：文件签名逻辑
+    // ---------------------------------------------------------------------
+
     private function hasConfigFilesChanged(): bool
     {
         if (!file_exists($this->cacheFile)) {
             return false;
         }
 
-        $oldCacheContent = @file_get_contents($this->cacheFile);
-        $oldCacheData = @unserialize($oldCacheContent);
-        if (!is_array($oldCacheData) || !isset($oldCacheData['file_signature'])) {
+        $old = @unserialize((string)file_get_contents($this->cacheFile));
+        if (!is_array($old) || !isset($old['file_signature'])) {
             return true;
         }
 
-        $currentSignature = $this->generateFileSignature();
-        return $currentSignature !== $oldCacheData['file_signature'];
+        return $old['file_signature'] !== $this->generateFileSignature();
     }
 
     private function generateFileSignature(): string
     {
-        $signatureParts = [];
+        $parts = [];
         foreach ($this->configFiles as $file) {
-            if (file_exists($file) && is_readable($file)) {
-                $mtime = (string)filemtime($file);
-                $size = (string)filesize($file);
-                $signatureParts[] = $file . '|' . $mtime . '|' . $size;
+            if (is_file($file)) {
+                $parts[] = "{$file}|" . filemtime($file) . "|" . filesize($file);
             } else {
-                $signatureParts[] = $file . '|0|0';
+                $parts[] = "{$file}|0|0";
             }
         }
-        return md5(implode(';', $signatureParts));
+
+        return md5(implode(';', $parts));
     }
 
-    // --- 原有缓存逻辑（兼容旧用法）---
+    // ---------------------------------------------------------------------
+    // 兼容旧逻辑：原始缓存模式
+    // ---------------------------------------------------------------------
+
     private function getOriginalCache(): ?array
     {
-        if (!file_exists($this->cacheFile) || !is_readable($this->cacheFile)) {
+        if (!file_exists($this->cacheFile)) {
             return null;
         }
 
@@ -203,89 +162,67 @@ class ConfigCache
             return null;
         }
 
-        $cacheContent = file_get_contents($this->cacheFile);
-        if ($cacheContent === false) {
-            $this->clear();
-            return null;
-        }
-
-        $cachedData = @unserialize($cacheContent);
-        return is_array($cachedData) ? $cachedData : null;
+        $data = @unserialize((string)file_get_contents($this->cacheFile));
+        return is_array($data) ? $data : null;
     }
 
     private function setOriginalCache(array $data): void
     {
-        $serializedData = serialize($data);
-        if ($serializedData === false) {
-            throw new ConfigException('Failed to serialize config data for caching');
+        $this->writeCacheData($data);
+    }
+
+    // ---------------------------------------------------------------------
+    // 通用写入逻辑（原始模式 & 自动刷新都有）
+    // ---------------------------------------------------------------------
+
+    private function writeCacheData(array $data): void
+    {
+        $payload = serialize($data);
+        if ($payload === false) {
+            throw new ConfigException('Failed to serialize config data');
         }
 
-        $cacheDir = dirname($this->cacheFile);
-        if (!is_dir($cacheDir) && !mkdir($cacheDir, 0755, true)) {
-            throw new ConfigException("Failed to create cache directory: {$cacheDir}");
+        $dir = dirname($this->cacheFile);
+        if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+            throw new ConfigException("Failed to create cache directory: {$dir}");
         }
 
-        $fileHandle = fopen($this->cacheFile, 'w');
-        if (!$fileHandle) {
-            throw new ConfigException("Failed to open cache file for writing: {$this->cacheFile}");
+        $fp = fopen($this->cacheFile, 'w');
+        if (!$fp) {
+            throw new ConfigException("Failed to write cache file: {$this->cacheFile}");
         }
 
-        if (!flock($fileHandle, LOCK_EX)) {
-            fclose($fileHandle);
-            throw new ConfigException("Failed to lock cache file: {$this->cacheFile}");
-        }
-
-        $writeResult = fwrite($fileHandle, $serializedData);
-        fflush($fileHandle);
-        flock($fileHandle, LOCK_UN);
-        fclose($fileHandle);
-
-        if ($writeResult === false || $writeResult !== strlen($serializedData)) {
-            $this->clear();
-            throw new ConfigException("Failed to write complete data to cache file: {$this->cacheFile}");
-        }
+        flock($fp, LOCK_EX);
+        fwrite($fp, $payload);
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
 
         chmod($this->cacheFile, 0644);
     }
 
-    // --- 辅助方法 ---
+    // ---------------------------------------------------------------------
+    // 辅助
+    // ---------------------------------------------------------------------
+
+    private function validateCachePath(string $path): void
+    {
+        if ($path === '') {
+            throw new ConfigException("Cache file path cannot be empty");
+        }
+    }
+
+    private function filterValidConfigFiles(array $list): array
+    {
+        return array_values(array_filter(
+            $list,
+            fn($f) => is_string($f) && $f !== ''
+        ));
+    }
+
     private function isCacheValid(): bool
     {
-        if ($this->ttl <= 0) {
-            return true;
-        }
-
-        $fileMtime = filemtime($this->cacheFile);
-        if ($fileMtime === false) {
-            return false;
-        }
-
-        return (time() - $fileMtime) <= $this->ttl;
-    }
-
-    private function filterValidConfigFiles(array $files): array
-    {
-        $validFiles = [];
-        foreach ($files as $file) {
-            $file = realpath($file);
-            if ($file && is_file($file) && is_readable($file)) {
-                $validFiles[] = $file;
-            }
-        }
-        return array_unique($validFiles);
-    }
-
-    private function validateCachePath(string $cacheFile): void
-    {
-        $cacheDir = dirname($cacheFile);
-        $systemTempDir = sys_get_temp_dir();
-        if (strpos(realpath($cacheDir) ?: $cacheDir, realpath($systemTempDir) ?: $systemTempDir) === 0) {
-            throw new ConfigException('Cache file cannot be placed in system temporary directory');
-        }
-
-        $webRoot = $_SERVER['DOCUMENT_ROOT'] ?? '';
-        if (!empty($webRoot) && strpos(realpath($cacheFile) ?: $cacheFile, realpath($webRoot) ?: $webRoot) === 0) {
-            throw new ConfigException('Cache file cannot be placed in web-accessible directory for security reasons');
-        }
+        return file_exists($this->cacheFile)
+            && (filemtime($this->cacheFile) + $this->ttl) >= time();
     }
 }

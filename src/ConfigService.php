@@ -11,7 +11,6 @@ declare(strict_types=1);
  * @Filename: ConfigService.php
  * @Date: 2025-12-3
  * @Developer: xuey863toy
- * @Email: xuey863toy@gmail.com
  */
 
 namespace Framework\Config;
@@ -24,17 +23,24 @@ use Framework\Config\Loader\IniFileLoader;
 use Framework\Config\Exception\ConfigException;
 use Framework\Config\Support\Arr;
 
+/**
+ * 配置中心：负责扫描、加载、缓存配置
+ * 支持排除指定文件（动态文件）并跳过缓存
+ */
 class ConfigService
 {
+    /** @var array 已加载的配置内容 */
     private array $config = [];
+
+    /** @var bool 是否已经加载过 */
     private bool $loaded = false;
 
     /**
-     * @param string $configDir Config 目录
-     * @param ConfigCache $cache 注入缓存驱动
-     * @param array|null $fileList 手动指定文件列表
-     * @param array $excludedFiles 需要排除的文件名（如 ['routes.php']），需包含扩展名
-     * @param array|null $customLoaders 自定义加载器
+     * @param string       $configDir      配置目录
+     * @param ConfigCache  $cache          缓存驱动
+     * @param array|null   $fileList       手动指定文件列表
+     * @param array        $excludedFiles  排除文件（动态加载，不缓存）
+     * @param array|null   $customLoaders  自定义加载器
      */
     public function __construct(
         private string $configDir,
@@ -43,11 +49,11 @@ class ConfigService
         private array $excludedFiles = ['routes.php', 'services.php'],
         private ?array $customLoaders = null
     ) {
-        $this->configDir = rtrim($this->configDir, '/\\') . DIRECTORY_SEPARATOR;
+        $this->configDir = rtrim($configDir, '/\\') . DIRECTORY_SEPARATOR;
     }
 
     /**
-     * 加载配置（核心逻辑：静态缓存配置 + 动态排除文件配置）
+     * 加载配置：静态缓存 + 动态排除文件
      */
     public function load(): array
     {
@@ -55,119 +61,110 @@ class ConfigService
             return $this->config;
         }
 
-        $staticConfig = $this->getStaticConfig();
-        $dynamicConfig = $this->loadExcludedConfigs();
+        $static = $this->loadStaticConfigs();
+        $dynamic = $this->loadExcludedConfigs();
 
-        // 合并配置：动态配置覆盖静态配置
-        $this->config = array_merge($staticConfig, $dynamicConfig);
+        // 动态配置覆盖静态
+        $this->config = array_replace($static, $dynamic);
         $this->loaded = true;
 
         return $this->config;
     }
 
     /**
-     * 获取可缓存的静态配置（跳过排除文件）
+     * 加载可缓存配置（非排除文件）
      */
-    private function getStaticConfig(): array
+    private function loadStaticConfigs(): array
     {
-        // 1. 收集所有有效配置文件（扫描目录/手动指定）
-        $files = $this->fileList !== null
+        // 1. 获取配置文件列表
+        $files = $this->fileList
             ? $this->normalizeFileList($this->fileList)
             : $this->listConfigFilesFromDir();
 
-        // 2. 过滤排除文件（只监控需要缓存的文件）
-        $validFiles = [];
-        foreach ($files as $file) {
-            if (!$this->isExcluded($file)) {
-                $validFiles[] = $file;
-            }
-        }
+        // 2. 过滤排除文件
+        $files = array_filter($files, fn($f) => !$this->isExcluded($f));
 
-        // 将配置文件列表传给缓存（自动刷新的核心）
-        $this->cache->setConfigFiles($validFiles);
+        // 注册给缓存：用于自动刷新判断
+        $this->cache->setConfigFiles(array_values($files));
 
-        // 3. 原有缓存逻辑不变
+        // 3. 读取缓存
         $cached = $this->cache->get();
         if (is_array($cached)) {
             return $cached;
         }
 
-        $data = [];
-        foreach ($validFiles as $file) {
+        // 4. 未命中缓存 → 重新加载
+        $result = [];
+        foreach ($files as $file) {
             $key = $this->keyFromFile($file);
             $loader = $this->resolveLoaderForFile($file);
-            $data[$key] = $loader->load($file);
+            $result[$key] = $loader->load($file);
         }
 
-        $this->cache->set($data);
-        return $data;
+        $this->cache->set($result);
+        return $result;
     }
 
     /**
-     * 实时加载被排除的文件（修复：仅加载需要作为配置的排除文件，非配置文件跳过）
+     * 加载排除的动态文件（不缓存）
      */
     private function loadExcludedConfigs(): array
     {
-        $data = [];
-        foreach ($this->excludedFiles as $filename) {
-            $filePath = $this->configDir . $filename;
+        $result = [];
 
-            // 修复1：先判断文件是否存在
-            if (!is_file($filePath)) {
+        foreach ($this->excludedFiles as $fileName) {
+            $file = $this->configDir . $fileName;
+
+            if (!is_file($file)) {
                 continue;
             }
 
-            // 修复2：判断文件是否为合法的配置文件（避免加载非配置文件如路由文件）
-            $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-            $supportedExts = ['php', 'json', 'ini'];
-            if (!in_array($ext, $supportedExts, true)) {
+            $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+
+            // 支持的格式
+            if (!in_array($ext, ['php', 'json', 'ini'], true)) {
                 continue;
             }
 
-            // 修复3：加载前先检查 PHP 文件是否返回数组（针对 PHP 类型的排除文件）
+            $key = $this->keyFromFile($file);
+
+            // PHP 文件必须返回数组才视为配置
             if ($ext === 'php') {
-                // 先尝试加载文件，验证是否返回数组
-                $tempData = require $filePath;
-                if (!is_array($tempData)) {
-                    // 非数组返回的 PHP 文件，视为非配置文件，跳过加载
-                    continue;
+                $value = require $file;
+                if (is_array($value)) {
+                    $result[$key] = $value;
                 }
-                $data[$this->keyFromFile($filePath)] = $tempData;
-            } else {
-                // 其他格式文件正常加载
-                $key = $this->keyFromFile($filePath);
-                $loader = $this->resolveLoaderForFile($filePath);
-                $data[$key] = $loader->load($filePath);
+                continue;
             }
+
+            // 其他格式正常加载
+            $loader = $this->resolveLoaderForFile($file);
+            $result[$key] = $loader->load($file);
         }
-        return $data;
+
+        return $result;
     }
 
     /**
-     * 判断文件是否在排除列表中（修复：支持大小写不敏感匹配，避免路径问题）
+     * 判断文件是否是排除文件（大小写不敏感）
      */
     private function isExcluded(string $filePath): bool
     {
-        $filename = basename($filePath);
-        // 修复：转为小写后匹配，避免大小写问题（如 Routes.php 和 routes.php 都能被排除）
-        $lowerFilename = strtolower($filename);
-        $lowerExcludedFiles = array_map('strtolower', $this->excludedFiles);
-        return in_array($lowerFilename, $lowerExcludedFiles, true);
+        $filename = strtolower(basename($filePath));
+        $excluded = array_map('strtolower', $this->excludedFiles);
+        return in_array($filename, $excluded, true);
     }
 
     /**
-     * 根据键名获取配置值
+     * 根据 key 获取配置值
      */
     public function get(string $key, mixed $default = null): mixed
     {
-        if (!$this->loaded) {
-            $this->load();
-        }
-        return Arr::get($this->config, $key, $default);
+        return Arr::get($this->load(), $key, $default);
     }
 
     /**
-     * 清空缓存并重置配置
+     * 清空缓存
      */
     public function clearCache(): void
     {
@@ -176,39 +173,35 @@ class ConfigService
         $this->loaded = false;
     }
 
-    /**
-     * 获取当前排除的文件列表
-     */
     public function getExcludedFiles(): array
     {
         return $this->excludedFiles;
     }
 
-    /**
-     * 动态添加排除文件
-     */
-    public function addExcludedFile(string $filename): void
+    public function addExcludedFile(string $file): void
     {
-        if (!in_array($filename, $this->excludedFiles, true)) {
-            $this->excludedFiles[] = $filename;
+        if (!in_array($file, $this->excludedFiles, true)) {
+            $this->excludedFiles[] = $file;
             $this->clearCache();
         }
     }
 
-    // --- 原有辅助方法保持不变 ---
+    // --- 辅助方法 -----------------------------------------------------
+
     private function normalizeFileList(array $list): array
     {
-        $out = [];
-        foreach ($list as $f) {
-            $path = $f;
-            if (! (strpos($f, DIRECTORY_SEPARATOR) === 0 || preg_match('#^[A-Za-z]:\\\\#', $f))) {
-                $path = $this->configDir . ltrim($f, '/\\');
+        $output = [];
+        foreach ($list as $file) {
+            // 不是绝对路径 → 转换为绝对路径
+            if (!str_starts_with($file, DIRECTORY_SEPARATOR)
+                && !preg_match('#^[A-Za-z]:\\\\#', $file)) {
+                $file = $this->configDir . ltrim($file, '/\\');
             }
-            if (is_file($path)) {
-                $out[] = $path;
+            if (is_file($file)) {
+                $output[] = $file;
             }
         }
-        return $out;
+        return $output;
     }
 
     private function listConfigFilesFromDir(): array
@@ -226,19 +219,19 @@ class ConfigService
     {
         $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
 
-        if (is_array($this->customLoaders) && isset($this->customLoaders[$ext])) {
+        if ($this->customLoaders[$ext] ?? false) {
             $loader = $this->customLoaders[$ext];
-            if (! $loader instanceof LoaderInterface) {
+            if (!$loader instanceof LoaderInterface) {
                 throw new ConfigException("Custom loader for .$ext must implement LoaderInterface");
             }
             return $loader;
         }
 
         return match ($ext) {
-            'php' => new PhpFileLoader(),
+            'php'  => new PhpFileLoader(),
             'json' => new JsonFileLoader(),
-            'ini' => new IniFileLoader(),
-            default => throw new ConfigException("Unsupported config file extension: .$ext"),
+            'ini'  => new IniFileLoader(),
+            default => throw new ConfigException("Unsupported config extension: .$ext"),
         };
     }
 }
