@@ -70,22 +70,30 @@ class ConfigService
      */
     private function getStaticConfig(): array
     {
+        // 1. 收集所有有效配置文件（扫描目录/手动指定）
+        $files = $this->fileList !== null
+            ? $this->normalizeFileList($this->fileList)
+            : $this->listConfigFilesFromDir();
+
+        // 2. 过滤排除文件（只监控需要缓存的文件）
+        $validFiles = [];
+        foreach ($files as $file) {
+            if (!$this->isExcluded($file)) {
+                $validFiles[] = $file;
+            }
+        }
+
+        // 将配置文件列表传给缓存（自动刷新的核心）
+        $this->cache->setConfigFiles($validFiles);
+
+        // 3. 原有缓存逻辑不变
         $cached = $this->cache->get();
         if (is_array($cached)) {
             return $cached;
         }
 
-        $files = $this->fileList !== null
-            ? $this->normalizeFileList($this->fileList)
-            : $this->listConfigFilesFromDir();
-
         $data = [];
-        foreach ($files as $file) {
-            // 关键：跳过排除文件（修复：确保所有扫描到的文件都经过排除判断）
-            if ($this->isExcluded($file)) {
-                continue;
-            }
-
+        foreach ($validFiles as $file) {
             $key = $this->keyFromFile($file);
             $loader = $this->resolveLoaderForFile($file);
             $data[$key] = $loader->load($file);
