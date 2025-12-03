@@ -70,7 +70,7 @@ PHP;
     }
 
     /**
-     * 兼容你旧方法 set()
+     * 兼容旧方法 set()
      */
     public function set(array $data): void
     {
@@ -78,7 +78,7 @@ PHP;
     }
 
     /**
-     * 兼容你旧方法 get()
+     * 兼容旧方法 get()
      */
     public function get(): ?array
     {
