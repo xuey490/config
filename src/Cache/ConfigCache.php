@@ -183,7 +183,7 @@ class ConfigCache
         }
 
         $dir = dirname($this->cacheFile);
-        if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
             throw new ConfigException("Failed to create cache directory: {$dir}");
         }
 
